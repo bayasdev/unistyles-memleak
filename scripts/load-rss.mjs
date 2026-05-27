@@ -10,6 +10,9 @@ const args = parseArgs(process.argv.slice(2));
 const targetRps = readNumberArg(args, "rps", 10_000);
 const durationSeconds = readNumberArg(args, "duration", 30);
 const concurrency = readNumberArg(args, "concurrency", 1024);
+const requestTimeoutMs = readNumberArg(args, "request-timeout", 10_000);
+const drainTimeoutMs = readNumberArg(args, "drain-timeout", 30_000);
+const warmupRequests = readNumberArg(args, "warmup", 20);
 const port = readNumberArg(args, "port", DEFAULT_PORT);
 const host = readStringArg(args, "host", "127.0.0.1");
 const path = readStringArg(args, "path", "/");
@@ -26,6 +29,7 @@ try {
   }
 
   await waitForServer(baseUrl);
+  await warmup(new URL(path, baseUrl), warmupRequests, requestTimeoutMs);
 
   const before = await readRss(baseUrl, true);
   const result = await runLoad({
@@ -33,6 +37,8 @@ try {
     rps: targetRps,
     durationSeconds,
     concurrency,
+    requestTimeoutMs,
+    drainTimeoutMs,
   });
 
   await sleep(cooldownMs);
@@ -48,6 +54,9 @@ try {
           rps: targetRps,
           durationSeconds,
           concurrency,
+          requestTimeoutMs,
+          drainTimeoutMs,
+          warmupRequests,
         },
         server: {
           pid: before.pid,
@@ -72,6 +81,18 @@ try {
     serverProcess.expectedExit = true;
     serverProcess.kill("SIGTERM");
     await once(serverProcess, "exit").catch(() => undefined);
+  }
+}
+
+async function warmup(url, count, requestTimeoutMs) {
+  const agent = createAgent(url, Math.min(count, 32));
+
+  try {
+    for (let index = 0; index < count; index += 1) {
+      await requestOnce(url, agent, requestTimeoutMs);
+    }
+  } finally {
+    agent.destroy();
   }
 }
 
@@ -193,12 +214,18 @@ async function waitForServer(baseUrl) {
 
 async function readRss(baseUrl, collectGarbage) {
   const url = new URL("/api/rss", baseUrl);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10_000);
 
   if (collectGarbage) {
     url.searchParams.set("gc", "1");
   }
 
-  const response = await fetch(url);
+  const response = await fetch(url, { signal: controller.signal }).finally(
+    () => {
+      clearTimeout(timeout);
+    },
+  );
 
   if (!response.ok) {
     throw new Error(`RSS endpoint returned ${response.status}`);
@@ -207,7 +234,14 @@ async function readRss(baseUrl, collectGarbage) {
   return response.json();
 }
 
-async function runLoad({ url, rps, durationSeconds, concurrency }) {
+async function runLoad({
+  url,
+  rps,
+  durationSeconds,
+  concurrency,
+  requestTimeoutMs,
+  drainTimeoutMs,
+}) {
   const agent = createAgent(url, concurrency);
   const totalRequests = Math.round(rps * durationSeconds);
   const start = performance.now();
@@ -219,8 +253,22 @@ async function runLoad({ url, rps, durationSeconds, concurrency }) {
   let inFlight = 0;
   let errors = 0;
   let timer;
+  let forcedStop = false;
 
   await new Promise((resolve) => {
+    let resolved = false;
+
+    const finish = (wasForced = false) => {
+      if (resolved) {
+        return;
+      }
+
+      resolved = true;
+      forcedStop = wasForced;
+      clearInterval(timer);
+      resolve();
+    };
+
     const pump = () => {
       const now = performance.now();
       const elapsedMs = Math.min(now - start, durationSeconds * 1000);
@@ -228,11 +276,21 @@ async function runLoad({ url, rps, durationSeconds, concurrency }) {
         totalRequests,
         Math.floor((elapsedMs / 1000) * rps),
       );
+      const isPastSendWindow = now >= end;
 
-      while (sent < expectedSent && inFlight < concurrency) {
+      if (isPastSendWindow && now >= end + drainTimeoutMs) {
+        finish(true);
+        return;
+      }
+
+      while (
+        !isPastSendWindow &&
+        sent < expectedSent &&
+        inFlight < concurrency
+      ) {
         sent += 1;
         inFlight += 1;
-        requestOnce(url, agent)
+        requestOnce(url, agent, requestTimeoutMs)
           .then(({ statusCode, latency }) => {
             latencies.push(latency);
             statusCodes.set(statusCode, (statusCodes.get(statusCode) ?? 0) + 1);
@@ -244,15 +302,14 @@ async function runLoad({ url, rps, durationSeconds, concurrency }) {
             completed += 1;
             inFlight -= 1;
 
-            if (performance.now() < end || completed < sent) {
+            if (!resolved && (performance.now() < end || completed < sent)) {
               pump();
             }
           });
       }
 
-      if (now >= end && completed >= sent) {
-        clearInterval(timer);
-        resolve();
+      if (isPastSendWindow && completed >= sent) {
+        finish();
       }
     };
 
@@ -268,6 +325,8 @@ async function runLoad({ url, rps, durationSeconds, concurrency }) {
   return {
     sent,
     completed,
+    inFlight,
+    forcedStop,
     errors,
     elapsedSeconds: Number(elapsedSeconds.toFixed(3)),
     achievedRps: Number((completed / elapsedSeconds).toFixed(2)),
@@ -290,7 +349,7 @@ function createAgent(url, maxSockets) {
   });
 }
 
-function requestOnce(url, agent) {
+function requestOnce(url, agent, requestTimeoutMs) {
   const client = url.protocol === "https:" ? https : http;
   const startedAt = performance.now();
 
@@ -317,6 +376,11 @@ function requestOnce(url, agent) {
     );
 
     request.on("error", reject);
+    request.setTimeout(requestTimeoutMs, () => {
+      request.destroy(
+        new Error(`request timed out after ${requestTimeoutMs}ms`),
+      );
+    });
     request.end();
   });
 }
